@@ -1,0 +1,133 @@
+#----------------------------------------------------
+#Initial Code for ReACT Prompt
+#-----------------------------------------------------
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+# Image size
+width, height = 800, 800
+max_iter = 100
+
+# Create coordinate grid
+x = np.linspace(-2, 1, width)
+y = np.linspace(-1.5, 1.5, height)
+X, Y = np.meshgrid(x, y)
+C = X + 1j * Y
+
+Z = np.zeros_like(C)
+div_time = np.zeros(C.shape, dtype=int)
+
+# Mandelbrot iteration
+for i in range(max_iter):
+    Z = Z**2 + C
+    diverged = np.abs(Z) > 2
+    div_now = diverged & (div_time == 0)
+    div_time[div_now] = i
+    Z[diverged] = 2
+
+# Plot
+plt.imshow(div_time, cmap='inferno', extent=(-2, 1, -1.5, 1.5))
+plt.colorbar()
+plt.title("Mandelbrot Fractal")
+plt.show()
+
+#------------------------------------------------------
+#Revised Code based on ReACT approach
+#------------------------------------------------------
+
+import numpy as np
+import matplotlib.pyplot as plt
+import time
+
+width = 800
+height = 800
+max_iter = 400
+
+xlim = (-2.0, 1.0)
+ylim = (-1.5, 1.5)
+
+use_smoothing = True   # Set to False for classic integer coloring
+colormap = "inferno"
+
+# Mandelbrot Function
+
+def mandelbrot(width, height, max_iter, xlim, ylim, smooth=False):
+    """
+    Compute Mandelbrot escape times.
+
+    Returns:
+        div_time (int array)
+        smooth_counts (float array or None)
+    """
+
+    # Create complex grid
+    x = np.linspace(xlim[0], xlim[1], width)
+    y = np.linspace(ylim[0], ylim[1], height)
+    X, Y = np.meshgrid(x, y)
+    C = X + 1j * Y
+
+    Z = np.zeros_like(C, dtype=np.complex128)
+    div_time = np.zeros(C.shape, dtype=np.int32)
+    not_diverged = np.ones(C.shape, dtype=bool)
+
+    smooth_counts = np.zeros(C.shape, dtype=float) if smooth else None
+
+    for i in range(1, max_iter + 1):
+        if not np.any(not_diverged):
+            break
+
+        # Update only non-diverged points
+        Z[not_diverged] = Z[not_diverged]**2 + C[not_diverged]
+
+        # Squared magnitude (faster than abs)
+        mag2 = Z.real**2 + Z.imag**2
+
+        just_diverged = (mag2 > 4) & not_diverged
+
+        div_time[just_diverged] = i
+        not_diverged[just_diverged] = False
+
+        if smooth and np.any(just_diverged):
+            zn = Z[just_diverged]
+            abs_zn = np.sqrt(zn.real**2 + zn.imag**2)
+            with np.errstate(divide='ignore'):
+                nu = i + 1 - np.log(np.log(abs_zn)) / np.log(2)
+            smooth_counts[just_diverged] = nu
+
+    # Points that never diverged
+    div_time[not_diverged] = max_iter
+    if smooth:
+        smooth_counts[not_diverged] = float(max_iter)
+
+    return div_time, smooth_counts
+
+# Compute
+start = time.time()
+div_time, smooth_counts = mandelbrot(
+    width, height, max_iter, xlim, ylim, smooth=use_smoothing
+)
+end = time.time()
+
+print(f"Computation time: {end - start:.3f} seconds")
+
+# Plot
+
+plt.figure(figsize=(8, 8))
+
+data_to_plot = smooth_counts if use_smoothing else div_time
+
+plt.imshow(
+    data_to_plot,
+    extent=(xlim[0], xlim[1], ylim[0], ylim[1]),
+    cmap=colormap,
+    origin="lower",
+    aspect="equal"
+)
+
+plt.colorbar(label="Iteration Count")
+plt.xlabel("Real Axis")
+plt.ylabel("Imaginary Axis")
+plt.title("Mandelbrot Set")
+
+plt.show()
