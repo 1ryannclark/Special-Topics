@@ -1,1 +1,855 @@
+#Colab Link: https://colab.research.google.com/drive/1JUVOCKnNyjopHCez73l5ZjCLj_LgniFy?usp=sharing
+# Prompts:
+# 1. Can you please create an AI chatbot customer support prototype using Python3 that I can run in Google Colab?
+# 2. Can you edit the UI to make it look better? Modernize it to fit current design standards and trends in the market
+# 3. Can you switch it to light mode and make it look like inspiration from Zendesk?
 
+!pip -q install ipywidgets
+
+import re
+import json
+from dataclasses import dataclass, field
+from typing import Dict, List, Tuple, Optional
+import ipywidgets as widgets
+from IPython.display import display, Markdown, clear_output
+
+KB = [
+    {
+        "intent": "shipping",
+        "patterns": ["where is my order", "track", "tracking", "shipping", "delivery", "arrive", "when will"],
+        "answer": (
+            "I can help with shipping. If you share your order number (e.g., **A1001**), "
+            "I’ll check its latest status."
+        ),
+    },
+    {
+        "intent": "returns",
+        "patterns": ["return", "refund", "exchange", "send back", "wrong item", "damaged"],
+        "answer": (
+            "For returns: items can be returned within **30 days** of delivery if unused and in original packaging. "
+            "If you share your order number, I can start a return."
+        ),
+    },
+    {
+        "intent": "billing",
+        "patterns": ["charged", "billing", "invoice", "payment", "card", "receipt", "double charge"],
+        "answer": (
+            "I can help with billing. If you tell me whether this is about an **invoice**, a **charge**, or a **refund**, "
+            "I’ll guide you to the right next step."
+        ),
+    },
+    {
+        "intent": "technical",
+        "patterns": ["doesn't work", "not working", "error", "bug", "crash", "issue", "problem", "login"],
+        "answer": (
+            "Sorry about that — let’s troubleshoot. Tell me what you were doing, the exact error message (if any), "
+            "and your device/browser."
+        ),
+    },
+    {
+        "intent": "agent",
+        "patterns": ["human", "agent", "representative", "call", "phone", "talk to someone", "real person"],
+        "answer": (
+            "No problem. I can connect you to a human agent. "
+            "Before I do, can you share a short summary of the issue and your order number (if relevant)?"
+        ),
+    },
+]
+
+POLICIES = {
+    "return_window_days": 30,
+    "support_hours": "Mon–Fri, 9am–5pm PT",
+    "sla": "Most requests get a reply within 24 hours.",
+}
+
+MOCK_ORDERS = {
+    "A1001": {"status": "In transit", "carrier": "UPS", "eta": "2026-03-01", "items": ["Wireless Mouse"]},
+    "A1002": {"status": "Delivered", "carrier": "FedEx", "eta": "2026-02-20", "items": ["Mechanical Keyboard"]},
+    "A1003": {"status": "Processing", "carrier": None, "eta": "2026-03-03", "items": ["USB-C Hub"]},
+}
+
+def normalize(text: str) -> str:
+    return re.sub(r"\s+", " ", text.strip().lower())
+
+def extract_order_id(text: str) -> Optional[str]:
+    m = re.search(r"\bA\d{4}\b", text.upper())
+    return m.group(0) if m else None
+
+def detect_intent(text: str) -> Tuple[str, float]:
+    """
+    Very simple rules-based intent match.
+    Returns (intent, confidence).
+    """
+    t = normalize(text)
+    best_intent = "general"
+    best_score = 0.0
+
+    for entry in KB:
+        patterns = entry["patterns"]
+        score = 0
+        for p in patterns:
+            if p in t:
+                score += 1
+
+        # normalize by pattern count
+        conf = score / max(1, len(patterns))
+        if conf > best_score:
+            best_score = conf
+            best_intent = entry["intent"]
+
+    # if no matches
+    if best_score == 0:
+        return "general", 0.2
+    return best_intent, min(0.95, 0.3 + best_score)
+
+def kb_answer(intent: str) -> str:
+    for entry in KB:
+        if entry["intent"] == intent:
+            return entry["answer"]
+    return (
+        "I can help with orders, shipping, returns, billing, and technical issues. "
+        "What can I help you with today?"
+    )
+
+@dataclass
+class SessionState:
+    history: List[Dict[str, str]] = field(default_factory=list)
+    last_intent: str = "general"
+    last_order_id: Optional[str] = None
+
+def format_order(order_id: str, record: Dict[str, str]) -> str:
+    carrier = record.get("carrier") or "—"
+    items = ", ".join(record.get("items", [])) or "—"
+    return (
+        f"**Order {order_id}**\n"
+        f"- Status: **{record.get('status','—')}**\n"
+        f"- Carrier: **{carrier}**\n"
+        f"- ETA: **{record.get('eta','—')}**\n"
+        f"- Items: {items}"
+    )
+
+def handle_message(user_text: str, state: SessionState) -> str:
+    order_id = extract_order_id(user_text)
+    if order_id:
+        state.last_order_id = order_id
+
+    intent, conf = detect_intent(user_text)
+    state.last_intent = intent
+
+    # Order lookup shortcut if user provided an order id
+    if state.last_order_id and (intent in ["shipping", "returns"] or "order" in normalize(user_text)):
+        oid = state.last_order_id
+        if oid in MOCK_ORDERS:
+            record = MOCK_ORDERS[oid]
+            base = format_order(oid, record)
+
+            if intent == "returns":
+                return (
+                    base
+                    + "\n\nIf you want to return this order, reply with:\n"
+                      "- **reason** (e.g., changed mind / damaged / wrong item)\n"
+                      "- whether the package is **opened or unopened**\n"
+                      "- preferred resolution: **refund** or **exchange**"
+                )
+
+            if intent == "shipping":
+                return (
+                    base
+                    + "\n\nIf you want, tell me your **zip/postal code** and I can confirm delivery region details."
+                )
+
+            return base
+
+        return (
+            f"I couldn’t find **{oid}** in the system. Double-check the order number (format like **A1001**) "
+            "or tell me the email used at checkout."
+        )
+
+    # General + FAQ responses
+    if intent == "general":
+        return (
+            "Hi! I’m your support assistant.\n\n"
+            "I can help with:\n"
+            "- **Order tracking** (share an order like A1001)\n"
+            "- **Returns & refunds**\n"
+            "- **Billing & invoices**\n"
+            "- **Technical troubleshooting**\n\n"
+            "What are you contacting us about today?"
+        )
+
+    # If we have a likely intent but no order id where it might help, prompt gently
+    if intent in ["shipping", "returns"] and not state.last_order_id:
+        return kb_answer(intent)
+
+    # default KB answer
+    return kb_answer(intent)
+
+    state = SessionState()
+
+chat_out = widgets.Output()
+input_box = widgets.Text(
+    value="",
+    placeholder="Type your message here (try: 'Where is my order A1001?')",
+    description="You:",
+    disabled=False,
+    layout=widgets.Layout(width="80%")
+)
+send_btn = widgets.Button(description="Send", button_style="primary")
+
+def render_message(role: str, text: str):
+    with chat_out:
+        if role == "user":
+            display(Markdown(f"**You:** {text}"))
+        else:
+            display(Markdown(f"**Bot:** {text}"))
+
+def on_send(_):
+    user_text = input_box.value.strip()
+    if not user_text:
+        return
+    input_box.value = ""
+
+    render_message("user", user_text)
+    bot_text = handle_message(user_text, state)
+    render_message("bot", bot_text)
+
+send_btn.on_click(on_send)
+
+display(widgets.VBox([
+    widgets.HTML("<h3>Customer Support Chatbot Prototype</h3>"),
+    chat_out,
+    widgets.HBox([input_box, send_btn]),
+]))
+
+# Initial greeting
+render_message("bot", "Hi! How can I help today? You can ask about shipping, returns, billing, or technical issues.")
+
+################
+
+#UI update attempt from prompt 2
+
+# !pip -q install ipywidgets
+#
+# import datetime
+# import ipywidgets as widgets
+# from IPython.display import display, HTML
+#
+# # Ensure these exist from your earlier cells:
+# # - state = SessionState()
+# # - handle_message(user_text, state) -> str
+#
+# # --- Styling (modern card, bubbles, chips) ---
+# CSS = """
+# <style>
+# :root{
+#   --bg: #0b1220;
+#   --card: rgba(255,255,255,0.06);
+#   --card2: rgba(255,255,255,0.08);
+#   --border: rgba(255,255,255,0.10);
+#   --text: rgba(255,255,255,0.92);
+#   --muted: rgba(255,255,255,0.65);
+#   --user: rgba(99, 102, 241, 0.30);  /* indigo-ish */
+#   --bot: rgba(255,255,255,0.10);
+#   --shadow: 0 18px 60px rgba(0,0,0,0.35);
+#   --radius: 18px;
+#   --radius2: 14px;
+#   --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+#   --sans: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji","Segoe UI Emoji";
+# }
+# .modern-wrap{
+#   font-family: var(--sans);
+#   color: var(--text);
+#   background: radial-gradient(1200px 600px at 10% 0%, rgba(99,102,241,0.25), transparent 50%),
+#               radial-gradient(900px 500px at 90% 20%, rgba(16,185,129,0.18), transparent 55%),
+#               linear-gradient(180deg, var(--bg), #050815);
+#   padding: 18px;
+#   border-radius: 22px;
+#   border: 1px solid var(--border);
+#   box-shadow: var(--shadow);
+#   max-width: 920px;
+# }
+# .modern-header{
+#   display:flex;
+#   align-items:center;
+#   justify-content:space-between;
+#   gap:16px;
+#   padding: 6px 6px 14px 6px;
+# }
+# .brand{
+#   display:flex;
+#   align-items:center;
+#   gap:10px;
+# }
+# .logo{
+#   width:36px;height:36px;
+#   border-radius: 12px;
+#   background: linear-gradient(135deg, rgba(99,102,241,0.95), rgba(16,185,129,0.85));
+#   box-shadow: 0 10px 26px rgba(99,102,241,0.25);
+# }
+# .title{
+#   font-size: 18px;
+#   font-weight: 700;
+#   line-height: 1.15;
+# }
+# .subtitle{
+#   font-size: 12.5px;
+#   color: var(--muted);
+#   margin-top: 2px;
+# }
+# .badge{
+#   font-size: 12px;
+#   color: rgba(255,255,255,0.85);
+#   background: rgba(255,255,255,0.08);
+#   border: 1px solid var(--border);
+#   padding: 8px 10px;
+#   border-radius: 999px;
+# }
+# .chat-card{
+#   background: var(--card);
+#   border: 1px solid var(--border);
+#   border-radius: var(--radius);
+#   padding: 12px;
+# }
+# .chat-scroll{
+#   height: 420px;
+#   overflow-y: auto;
+#   padding: 6px 8px;
+# }
+# .row{
+#   display:flex;
+#   margin: 10px 0;
+#   gap:10px;
+# }
+# .row.user{ justify-content:flex-end; }
+# .row.bot{ justify-content:flex-start; }
+# .bubble{
+#   max-width: 75%;
+#   border-radius: var(--radius);
+#   padding: 10px 12px;
+#   border: 1px solid var(--border);
+#   background: var(--bot);
+#   backdrop-filter: blur(10px);
+#   -webkit-backdrop-filter: blur(10px);
+# }
+# .bubble.user{
+#   background: var(--user);
+# }
+# .meta{
+#   font-size: 11px;
+#   color: var(--muted);
+#   margin-top: 6px;
+#   display:flex;
+#   gap:8px;
+#   align-items:center;
+# }
+# .meta .dot{
+#   width:4px;height:4px;border-radius:99px;background: rgba(255,255,255,0.35);
+# }
+# .code{
+#   font-family: var(--mono);
+#   font-size: 12px;
+#   background: rgba(0,0,0,0.25);
+#   border: 1px solid var(--border);
+#   padding: 8px 10px;
+#   border-radius: 12px;
+#   margin-top: 8px;
+# }
+# .input-bar{
+#   display:flex;
+#   gap:10px;
+#   margin-top: 12px;
+# }
+# .chips{
+#   display:flex;
+#   flex-wrap:wrap;
+#   gap:8px;
+#   margin-top: 10px;
+# }
+# .chip{
+#   display:inline-flex;
+#   align-items:center;
+#   gap:8px;
+#   font-size: 12px;
+#   color: rgba(255,255,255,0.86);
+#   background: var(--card2);
+#   border: 1px solid var(--border);
+#   padding: 8px 10px;
+#   border-radius: 999px;
+# }
+# .hint{
+#   font-size: 12px;
+#   color: var(--muted);
+#   margin-top: 10px;
+# }
+# .small{
+#   font-size: 11px;
+#   color: var(--muted);
+# }
+# </style>
+# """
+#
+# display(HTML(CSS))
+#
+# # --- UI Widgets ---
+# header = widgets.HTML("""
+# <div class="modern-wrap">
+#   <div class="modern-header">
+#     <div class="brand">
+#       <div class="logo"></div>
+#       <div>
+#         <div class="title">Support Assistant</div>
+#         <div class="subtitle">Prototype UI • Fast triage, order lookups, and helpful next steps</div>
+#       </div>
+#     </div>
+#     <div class="badge">● Online</div>
+#   </div>
+# </div>
+# """)
+#
+# chat_html = widgets.HTML(value="")
+#
+#
+# def _now():
+#   return datetime.datetime.now().strftime("%-I:%M %p")
+#
+# # Store rendered messages (HTML) so we can re-render the whole chat area
+# rendered = []
+#
+# def _escape(s: str) -> str:
+#   return (s.replace("&","&amp;")
+#            .replace("<","&lt;")
+#            .replace(">","&gt;"))
+#
+# def _render_bubble(role: str, text: str):
+#   # Convert simple markdown-ish **bold** to <b> (lightweight, safe)
+#   safe = _escape(text)
+#   safe = re.sub(r"\*\*(.+?)\*\*", r"<b>\\1</b>", safe)
+#   safe = safe.replace("\n", "<br>")
+#
+#   who = "You" if role=="user" else "Bot"
+#   klass = "user" if role=="user" else "bot"
+#   bubble_class = "bubble user" if role=="user" else "bubble"
+#
+#   rendered.append(f"""
+#     <div class="row {klass}">
+#       <div class="{bubble_class}">
+#         {safe}
+#         <div class="meta">
+#           <span>{who}</span><span class="dot"></span><span>{_now()}</span>
+#         </div>
+#       </div>
+#     </div>
+#   """)
+#
+# def _refresh_chat():
+#   chat_html.value = f"""
+#   <div class="modern-wrap">
+#     <div class="chat-card">
+#       <div class="chat-scroll" id="chatScroll">
+#         {''.join(rendered)}
+#       </div>
+#       <div class="small">Tip: try <span style="font-family:var(--mono)">Where is my order A1001?</span></div>
+#     </div>
+#   </div>
+#   """
+#
+# input_box = widgets.Text(
+#     placeholder="Message Support Assistant… (press Enter to send)",
+#     layout=widgets.Layout(width="100%")
+# )
+# send_btn = widgets.Button(description="Send", button_style="primary", layout=widgets.Layout(width="140px"))
+#
+# # Quick reply chips
+# chip_labels = [
+#     ("Track order", "Where is my order A1001?"),
+#     ("Start return", "I want to return order A1002"),
+#     ("Billing", "I was charged twice"),
+#     ("Tech support", "The app isn't working — I get an error"),
+#     ("Human agent", "Can I speak to a human?"),
+# ]
+#
+# chip_buttons = []
+# for label, msg in chip_labels:
+#     b = widgets.Button(description=label, layout=widgets.Layout(height="34px"))
+#     b.add_class("chip")  # styling hook (ipywidgets supports class on some frontends)
+#     chip_buttons.append((b, msg))
+#
+# chips_row = widgets.HBox([b for b,_ in chip_buttons], layout=widgets.Layout(flex_flow="row wrap"))
+#
+# def send_message(user_text: str):
+#     user_text = user_text.strip()
+#     if not user_text:
+#         return
+#
+#     _render_bubble("user", user_text)
+#     bot_text = handle_message(user_text, state)
+#     _render_bubble("bot", bot_text)
+#     _refresh_chat()
+#
+# def on_send(_):
+#     send_message(input_box.value)
+#     input_box.value = ""
+#
+# def on_enter(change):
+#     # ipywidgets Text triggers on_submit in some versions; observe fallback for broad compatibility
+#     pass
+#
+# send_btn.on_click(on_send)
+#
+# # Press Enter to send (works in Colab)
+# input_box.on_submit(lambda _: on_send(None))
+#
+# # Wire chips
+# for b, msg in chip_buttons:
+#     b.on_click(lambda _, m=msg: send_message(m))
+#
+# # Initial message
+# rendered.clear()
+# _render_bubble("bot", "Hi! I’m your support assistant. What can I help you with today?")
+# _refresh_chat()
+#
+# ui = widgets.VBox([
+#     header,
+#     chat_html,
+#     widgets.HTML('<div class="modern-wrap"><div class="chips">Quick actions</div></div>'),
+#     widgets.VBox([chips_row], layout=widgets.Layout(width="100%")),
+#     widgets.HBox([input_box, send_btn], layout=widgets.Layout(width="100%")),
+#     widgets.HTML('<div class="modern-wrap"><div class="hint">Current features: intent routing, mock order lookup, and guided next steps. Add LLM later without changing the UI.</div></div>')
+# ])
+#
+# display(ui)
+
+!pip -q install ipywidgets
+
+import datetime
+import re
+import ipywidgets as widgets
+from IPython.display import display, HTML
+
+# Requires from earlier cells:
+# - state = SessionState()
+# - handle_message(user_text, state) -> str
+
+CSS = """
+<style>
+:root{
+  --bg: #f6f8fb;
+  --surface: #ffffff;
+  --surface2: #fbfcfe;
+  --border: #e6eaf0;
+  --text: #1f2937;
+  --muted: #6b7280;
+  --shadow: 0 14px 34px rgba(16,24,40,0.08);
+  --radius: 18px;
+  --radius2: 14px;
+
+  /* Zendesk-ish accent (teal/green family, subtle) */
+  --accent: #0f766e;         /* teal-700 */
+  --accentSoft: rgba(15,118,110,0.10);
+
+  --userBubble: rgba(15,118,110,0.12);
+  --botBubble: #ffffff;
+  --botBubbleTint: rgba(15,118,110,0.06);
+
+  --sans: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji","Segoe UI Emoji";
+  --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+}
+
+.zd-wrap{
+  font-family: var(--sans);
+  color: var(--text);
+  background: linear-gradient(180deg, var(--bg), #ffffff);
+  padding: 18px;
+  border-radius: 22px;
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow);
+  max-width: 960px;
+}
+
+.zd-topbar{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:16px;
+  padding: 6px 6px 14px 6px;
+}
+
+.zd-brand{
+  display:flex;
+  align-items:center;
+  gap:10px;
+}
+
+.zd-logo{
+  width:36px;height:36px;
+  border-radius: 12px;
+  background: linear-gradient(135deg, rgba(15,118,110,1), rgba(34,197,94,0.9));
+  box-shadow: 0 10px 22px rgba(15,118,110,0.15);
+}
+
+.zd-title{
+  font-size: 16px;
+  font-weight: 700;
+  line-height: 1.15;
+}
+.zd-subtitle{
+  font-size: 12.5px;
+  color: var(--muted);
+  margin-top: 2px;
+}
+
+.zd-status{
+  display:flex;
+  align-items:center;
+  gap:8px;
+  font-size: 12px;
+  color: var(--muted);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  padding: 8px 10px;
+  border-radius: 999px;
+}
+.zd-dot{
+  width:8px;height:8px;border-radius:99px;
+  background: #22c55e; /* green */
+  box-shadow: 0 0 0 4px rgba(34,197,94,0.15);
+}
+
+.zd-card{
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 12px;
+}
+
+.zd-chat{
+  height: 420px;
+  overflow-y: auto;
+  padding: 6px 8px;
+  background: var(--surface2);
+  border-radius: var(--radius2);
+  border: 1px solid var(--border);
+}
+
+.row{
+  display:flex;
+  margin: 10px 0;
+  gap:10px;
+}
+.row.user{ justify-content:flex-end; }
+.row.bot{ justify-content:flex-start; }
+
+.bubble{
+  max-width: 76%;
+  border-radius: 16px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  background: var(--botBubble);
+  box-shadow: 0 6px 16px rgba(16,24,40,0.06);
+}
+.bubble.bot{
+  background: linear-gradient(180deg, var(--botBubble), var(--botBubbleTint));
+}
+.bubble.user{
+  background: linear-gradient(180deg, var(--userBubble), rgba(15,118,110,0.08));
+  border-color: rgba(15,118,110,0.18);
+}
+
+.meta{
+  font-size: 11px;
+  color: var(--muted);
+  margin-top: 6px;
+  display:flex;
+  gap:8px;
+  align-items:center;
+}
+.meta .dot{
+  width:4px;height:4px;border-radius:99px;background: rgba(107,114,128,0.55);
+}
+
+.kbd{
+  font-family: var(--mono);
+  font-size: 12px;
+  padding: 2px 6px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: #fff;
+}
+
+.zd-actions{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:10px;
+  margin-top: 12px;
+}
+
+.zd-hint{
+  font-size: 12px;
+  color: var(--muted);
+  margin-top: 10px;
+}
+
+.chips{
+  display:flex;
+  flex-wrap:wrap;
+  gap:8px;
+  margin-top: 10px;
+}
+
+.chip{
+  display:inline-flex;
+  align-items:center;
+  font-size: 12px;
+  color: var(--accent);
+  background: var(--accentSoft);
+  border: 1px solid rgba(15,118,110,0.20);
+  padding: 8px 10px;
+  border-radius: 999px;
+}
+
+hr.zd{
+  border: none;
+  border-top: 1px solid var(--border);
+  margin: 12px 0;
+}
+</style>
+"""
+
+display(HTML(CSS))
+
+# --- Rendering helpers ---
+def _now():
+    return datetime.datetime.now().strftime("%-I:%M %p")
+
+rendered = []
+
+def _escape(s: str) -> str:
+    return (s.replace("&","&amp;")
+             .replace("<","&lt;")
+             .replace(">","&gt;"))
+
+def _mdlite(s: str) -> str:
+    # minimal **bold** only, safe
+    safe = _escape(s)
+    safe = re.sub(r"\*\*(.+?)\*\*", r"<b>\\1</b>", safe)
+    safe = safe.replace("\n", "<br>")
+    return safe
+
+def _bubble(role: str, text: str):
+    who = "You" if role == "user" else "Support"
+    row_class = "user" if role == "user" else "bot"
+    bubble_class = "bubble user" if role == "user" else "bubble bot"
+
+    rendered.append(f"""
+      <div class="row {row_class}">
+        <div class="{bubble_class}">
+          {_mdlite(text)}
+          <div class="meta">
+            <span>{who}</span><span class="dot"></span><span>{_now()}</span>
+          </div>
+        </div>
+      </div>
+    """)
+
+def _chat_html():
+    return f"""
+    <div class="zd-wrap">
+      <div class="zd-topbar">
+        <div class="zd-brand">
+          <div class="zd-logo"></div>
+          <div>
+            <div class="zd-title">Help Center Assistant</div>
+            <div class="zd-subtitle">Zendesk-inspired light UI • Triage → resolution</div>
+          </div>
+        </div>
+        <div class="zd-status"><span class="zd-dot"></span> Online</div>
+      </div>
+
+      <div class="zd-card">
+        <div class="zd-chat">
+          {''.join(rendered)}
+        </div>
+
+        <div class="zd-hint">
+          Try: <span class="kbd">Where is my order A1001?</span> or <span class="kbd">I want to return A1002</span>
+        </div>
+      </div>
+
+      <hr class="zd"/>
+
+      <div class="zd-hint">
+        Quick actions (click to send):
+      </div>
+      <div class="chips" id="chipRow"></div>
+    </div>
+    """
+
+# --- Widgets ---
+chat_view = widgets.HTML(value="")
+
+input_box = widgets.Text(
+    placeholder="Type a message… (Enter to send)",
+    layout=widgets.Layout(width="100%")
+)
+send_btn = widgets.Button(
+    description="Send",
+    button_style="",  # keep neutral; styling via CSS
+    layout=widgets.Layout(width="140px")
+)
+send_btn.style.button_color = "#0f766e"
+send_btn.style.font_weight = "600"
+send_btn.style.text_color = "white"
+
+# Zendesk-ish quick actions
+quick_actions = [
+    ("Track order", "Where is my order A1001?"),
+    ("Start a return", "I want to return order A1002"),
+    ("Billing issue", "I was charged twice"),
+    ("Technical issue", "The app isn't working — I get an error"),
+    ("Talk to an agent", "Can I speak to a human agent?"),
+]
+
+chip_buttons = []
+for label, msg in quick_actions:
+    b = widgets.Button(description=label, layout=widgets.Layout(height="34px"))
+    # Make chips look like the CSS "chip"
+    b.add_class("chip")
+    b.style.button_color = "rgba(15,118,110,0.10)"
+    b.style.font_weight = "600"
+    chip_buttons.append((b, msg))
+
+chips_row = widgets.HBox([b for b,_ in chip_buttons], layout=widgets.Layout(flex_flow="row wrap"))
+
+def _refresh():
+    chat_view.value = _chat_html()
+
+def send_message(text: str):
+    text = (text or "").strip()
+    if not text:
+        return
+    _bubble("user", text)
+    bot = handle_message(text, state)
+    _bubble("bot", bot)
+    _refresh()
+
+def on_send(_):
+    send_message(input_box.value)
+    input_box.value = ""
+
+send_btn.on_click(on_send)
+input_box.on_submit(lambda _: on_send(None))
+
+for b, msg in chip_buttons:
+    b.on_click(lambda _, m=msg: send_message(m))
+
+# Initial render
+rendered.clear()
+_bubble("bot", "Hi! I’m your support assistant. How can I help today?")
+_refresh()
+
+display(widgets.VBox([
+    chat_view,
+    chips_row,
+    widgets.HBox([input_box, send_btn], layout=widgets.Layout(width="100%"))
+]))
