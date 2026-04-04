@@ -1,1 +1,563 @@
+#Link to Colab: https://colab.research.google.com/drive/11cuHq6mBfuiLCJEP9AlLENyHVA_H16p4?usp=sharing
+import random
+from typing import Dict, List, Optional
 
+import pandas as pd
+import matplotlib.pyplot as plt
+from IPython.display import display, clear_output, Markdown
+import ipywidgets as widgets
+
+
+# Read data from CSV (https://www.kaggle.com/datasets/nudratabbas/global-ads-performance-google-meta-tiktok/data)
+def load_ads_data(csv_file: str) -> List[dict]:
+    df = pd.read_csv(csv_file)
+
+    # Rename columns to match the assignment wording
+    df = df.rename(columns={
+        "platform": "channel",
+        "ad_spend": "spend"
+    })
+
+    # Keep neccessary columns
+    df = df[["date", "channel", "impressions", "clicks", "spend", "conversions", "revenue", "CTR", "CPA"]]
+
+    # Rename platforms into the 3 assignment channels
+    df["channel"] = df["channel"].replace({
+        "Google Ads": "Search",
+        "Meta Ads": "Social",
+        "TikTok Ads": "Display"
+    })
+
+    # Calculate CVR safely
+    df["CVR"] = df["conversions"].div(df["clicks"]).fillna(0)
+
+    return df.to_dict("records")
+
+
+ads_data = load_ads_data("global_ads_performance_dataset.csv")
+
+CHANNELS = ["Search", "Social", "Display"]
+
+
+# Store model settings
+class Params:
+    def __init__(self, budget=50000, max_shift=0.15, floor=0.10, explore_rate=0.15, seed=7):
+        self.budget = budget
+        self.max_shift = max_shift
+        self.floor = floor
+        self.explore_rate = explore_rate
+        self.seed = seed
+
+
+# Group the data by day
+def process_data(raw_data: List[dict]) -> List[dict]:
+    by_date: Dict[str, Dict[str, dict]] = {}
+
+    for row in raw_data:
+        date = row["date"]
+        channel = row["channel"]
+
+        if date not in by_date:
+            by_date[date] = {}
+
+        by_date[date][channel] = row
+
+    days = []
+    sorted_dates = sorted(by_date.keys())[:30]
+
+    for i, date in enumerate(sorted_dates, start=1):
+        day = {
+            "date": date,
+            "dayNum": i
+        }
+
+        for ch in CHANNELS:
+            if ch in by_date[date]:
+                day[ch] = by_date[date][ch]
+            else:
+                day[ch] = None
+
+        days.append(day)
+
+    return days
+
+
+DAYS = process_data(ads_data)
+
+
+# Decide the next budget split
+def agent_decide(
+    day: dict,
+    alloc: Dict[str, float],
+    history: List[dict],
+    params: Params,
+    rng: random.Random
+):
+    max_shift = params.max_shift
+    floor = params.floor
+    explore_rate = params.explore_rate
+
+    # Explore various channels
+    is_explore = rng.random() < explore_rate
+
+    if is_explore:
+        new_alloc = dict(alloc)
+
+        winner = rng.choice(CHANNELS)
+        possible_losers = [c for c in CHANNELS if c != winner]
+        loser = rng.choice(possible_losers)
+
+        shift = max_shift * 0.5 * rng.random()
+
+        new_alloc[winner] = min(1 - 2 * floor, new_alloc[winner] + shift)
+        new_alloc[loser] = max(floor, new_alloc[loser] - shift)
+
+        total = sum(new_alloc.values())
+        for key in new_alloc:
+            new_alloc[key] = new_alloc[key] / total
+
+        return {
+            "alloc": new_alloc,
+            "type": "explore",
+            "reason": f"Explore: increased {winner} by about {shift * 100:.1f}% to test performance.",
+            "winner": winner,
+        }
+
+    # Score each channel using CVR and CPA
+    scores = {}
+
+    for ch in CHANNELS:
+        d = day[ch]
+
+        if not d:
+            scores[ch] = 0.0
+            continue
+
+        cvr_score = d["CVR"] * 100
+
+        if d["CPA"] > 0:
+            cpa_score = 50 / d["CPA"]
+        else:
+            cpa_score = 0
+
+        scores[ch] = (cvr_score * 0.6) + (cpa_score * 0.4)
+
+    sorted_channels = sorted(CHANNELS, key=lambda c: scores[c], reverse=True)
+    top = sorted_channels[0]
+    middle = sorted_channels[1]
+    bottom = sorted_channels[2]
+
+    new_alloc = dict(alloc)
+
+    # Guardrail: restore budget if a channel has been near the floor too long
+    recent_bottom = []
+    for h in history[-2:]:
+        recent_bottom.append(h["alloc"][bottom])
+
+    bottom_starved = len(recent_bottom) >= 2 and all(v <= floor + 0.01 for v in recent_bottom)
+
+    if bottom_starved:
+        shift = max_shift * 0.5
+
+        new_alloc[bottom] = min(new_alloc[bottom] + shift, 0.33)
+        new_alloc[top] = max(new_alloc[top] - shift * 0.7, floor)
+        new_alloc[middle] = max(new_alloc[middle] - shift * 0.3, floor)
+
+        total = sum(new_alloc.values())
+        for key in new_alloc:
+            new_alloc[key] = new_alloc[key] / total
+
+        return {
+            "alloc": new_alloc,
+            "type": "guardrail",
+            "reason": f"Guardrail: restored some budget to {bottom} so it keeps receiving spend.",
+            "winner": bottom,
+        }
+
+    # Shift budget toward the best channel
+    actual_shift = min(max_shift, new_alloc[bottom] - floor)
+
+    new_alloc[top] = min(1 - 2 * floor, new_alloc[top] + actual_shift)
+    new_alloc[bottom] = max(floor, new_alloc[bottom] - actual_shift * 0.7)
+    new_alloc[middle] = max(floor, new_alloc[middle] - actual_shift * 0.3)
+
+    total = sum(new_alloc.values())
+    for key in new_alloc:
+        new_alloc[key] = new_alloc[key] / total
+
+    top_day = day[top]
+
+    return {
+        "alloc": new_alloc,
+        "type": "exploit",
+        "reason": (
+            f"Exploit: shifted budget toward {top} because it had the best CVR "
+            f"({top_day['CVR'] * 100:.2f}%) and CPA (${top_day['CPA']:.2f})."
+        ),
+        "winner": top,
+    }
+
+
+# Run the simulation day by day
+def run_simulation(params: Params = Params()):
+    rng = random.Random(params.seed)
+
+    # Start with equal split
+    alloc = {
+        "Search": 1 / 3,
+        "Social": 1 / 3,
+        "Display": 1 / 3
+    }
+
+    results = []
+    history = []
+
+    for i, day in enumerate(DAYS):
+        if i == 0:
+            decision = {
+                "alloc": dict(alloc),
+                "type": "init",
+                "reason": "Started with an equal split across all channels.",
+                "winner": None,
+            }
+        else:
+            decision = agent_decide(day, alloc, history, params, rng)
+            alloc = decision["alloc"]
+
+        day_result = {
+            "dayNum": i + 1,
+            "date": day["date"],
+            "alloc": dict(alloc),
+            "type": decision["type"],
+            "reason": decision["reason"],
+            "winner": decision["winner"],
+            "agentConv": 0,
+            "agentRevenue": 0.0,
+            "agentSpend": 0.0,
+            "baseConv": 0,
+            "baseRevenue": 0.0,
+            "channelResults": {},
+        }
+
+        for ch in CHANNELS:
+            d = day.get(ch)
+
+            if not d:
+                continue
+
+            # Agent allocation
+            allocated = params.budget * alloc[ch]
+            spend_value = d["spend"]
+
+            if spend_value == 0:
+                actual_ratio = 1
+            else:
+                actual_ratio = allocated / spend_value
+
+            scaled_ratio = min(actual_ratio, 2)
+
+            scaled_conv = round(d["conversions"] * scaled_ratio)
+            scaled_rev = d["revenue"] * scaled_ratio
+
+            day_result["agentConv"] += scaled_conv
+            day_result["agentRevenue"] += scaled_rev
+            day_result["agentSpend"] += allocated
+
+            if scaled_conv == 0:
+                channel_cpa = allocated
+            else:
+                channel_cpa = allocated / scaled_conv
+
+            day_result["channelResults"][ch] = {
+                "conv": scaled_conv,
+                "cvr": d["CVR"],
+                "ctr": d["CTR"],
+                "cpa": channel_cpa,
+                "spend": allocated,
+            }
+
+            # Equal split baseline
+            base_alloc = params.budget / 3
+
+            if spend_value == 0:
+                base_ratio = 1
+            else:
+                base_ratio = base_alloc / spend_value
+
+            base_scaled_ratio = min(base_ratio, 2)
+
+            day_result["baseConv"] += round(d["conversions"] * base_scaled_ratio)
+            day_result["baseRevenue"] += d["revenue"] * base_scaled_ratio
+
+        if day_result["agentConv"] == 0:
+            day_result["agentCPA"] = day_result["agentSpend"]
+        else:
+            day_result["agentCPA"] = day_result["agentSpend"] / day_result["agentConv"]
+
+        results.append(day_result)
+        history.append(decision)
+
+    return results
+
+
+# Turn daily results into a dataframe
+def results_to_daily_df(results: List[dict]) -> pd.DataFrame:
+    rows = []
+
+    for r in results:
+        row = {
+            "day": r["dayNum"],
+            "date": r["date"],
+            "decision_type": r["type"],
+            "top_channel": r["winner"] or "-",
+            "agent_conversions": r["agentConv"],
+            "baseline_conversions": r["baseConv"],
+            "agent_revenue": r["agentRevenue"],
+            "baseline_revenue": r["baseRevenue"],
+            "agent_spend": r["agentSpend"],
+            "agent_cpa": r["agentCPA"],
+            "search_alloc": r["alloc"]["Search"],
+            "social_alloc": r["alloc"]["Social"],
+            "display_alloc": r["alloc"]["Display"],
+            "reason": r["reason"],
+        }
+        rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+# Summarize performance by channel
+def channel_summary_df(results: List[dict]) -> pd.DataFrame:
+    stats = {}
+
+    for ch in CHANNELS:
+        stats[ch] = {
+            "spend": 0.0,
+            "conv": 0,
+            "alloc_sum": 0.0,
+            "days": 0
+        }
+
+    for r in results:
+        for ch in CHANNELS:
+            if ch in r["channelResults"]:
+                stats[ch]["spend"] += r["channelResults"][ch]["spend"]
+                stats[ch]["conv"] += r["channelResults"][ch]["conv"]
+                stats[ch]["alloc_sum"] += r["alloc"][ch]
+                stats[ch]["days"] += 1
+
+    rows = []
+
+    for ch in CHANNELS:
+        s = stats[ch]
+
+        if s["conv"] == 0:
+            cpa_value = s["spend"]
+        else:
+            cpa_value = s["spend"] / s["conv"]
+
+        if s["days"] == 0:
+            avg_alloc = 0
+        else:
+            avg_alloc = 100 * s["alloc_sum"] / s["days"]
+
+        rows.append({
+            "channel": ch,
+            "spend": s["spend"],
+            "conversions": s["conv"],
+            "CPA": cpa_value,
+            "avg_allocation_pct": avg_alloc,
+        })
+
+    return pd.DataFrame(rows)
+
+
+# Calculate final summary metrics
+def summary_metrics(results: List[dict]) -> dict:
+    total_conv = sum(r["agentConv"] for r in results)
+    total_rev = sum(r["agentRevenue"] for r in results)
+    total_spend = sum(r["agentSpend"] for r in results)
+
+    base_conv = sum(r["baseConv"] for r in results)
+    base_rev = sum(r["baseRevenue"] for r in results)
+
+    if total_conv == 0:
+        avg_cpa = total_spend
+    else:
+        avg_cpa = total_spend / total_conv
+
+    if total_spend == 0:
+        roas = 0
+    else:
+        roas = total_rev / total_spend
+
+    if base_conv == 0:
+        base_cpa = total_spend
+    else:
+        base_cpa = total_spend / base_conv
+
+    if base_conv == 0:
+        conv_delta = 0
+    else:
+        conv_delta = 100 * (total_conv - base_conv) / base_conv
+
+    if base_rev == 0:
+        revenue_delta = 0
+    else:
+        revenue_delta = 100 * (total_rev - base_rev) / base_rev
+
+    if base_cpa == 0:
+        cpa_improvement = 0
+    else:
+        cpa_improvement = 100 * (base_cpa - avg_cpa) / base_cpa
+
+    return {
+        "Total Conversions": total_conv,
+        "Total Revenue": total_rev,
+        "Avg CPA": avg_cpa,
+        "ROAS": roas,
+        "Days Simulated": len(results),
+        "Conversion Delta % vs Baseline": conv_delta,
+        "Revenue Delta % vs Baseline": revenue_delta,
+        "CPA Improvement % vs Baseline": cpa_improvement,
+    }
+
+
+# Plot the visualization results
+def plot_results(results: List[dict]):
+    df = results_to_daily_df(results)
+
+    plt.figure(figsize=(12, 4))
+    plt.plot(df["day"], df["search_alloc"] * 100, label="Search")
+    plt.plot(df["day"], df["social_alloc"] * 100, label="Social")
+    plt.plot(df["day"], df["display_alloc"] * 100, label="Display")
+    plt.title("Daily Budget Allocation by Channel")
+    plt.xlabel("Day")
+    plt.ylabel("Allocation %")
+    plt.ylim(0, 100)
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.show()
+
+    plt.figure(figsize=(12, 4))
+    plt.plot(df["day"], df["agent_conversions"], label="Agent")
+    plt.plot(df["day"], df["baseline_conversions"], linestyle="--", label="Equal Split Baseline")
+    plt.title("Agent vs Baseline Conversions")
+    plt.xlabel("Day")
+    plt.ylabel("Conversions")
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.show()
+
+
+# Show tables and charts 30 days
+def display_results(results: List[dict]):
+    metrics = summary_metrics(results)
+
+    metrics_df = pd.DataFrame({
+        "metric": list(metrics.keys()),
+        "value": [
+            f"{metrics['Total Conversions']:,}",
+            f"${metrics['Total Revenue']:,.2f}",
+            f"${metrics['Avg CPA']:,.2f}",
+            f"{metrics['ROAS']:.2f}x",
+            f"{metrics['Days Simulated']}",
+            f"{metrics['Conversion Delta % vs Baseline']:.2f}%",
+            f"{metrics['Revenue Delta % vs Baseline']:.2f}%",
+            f"{metrics['CPA Improvement % vs Baseline']:.2f}%",
+        ],
+    })
+
+    display(Markdown("## Summary Metrics"))
+    display(metrics_df)
+
+    display(Markdown("## Channel Performance Summary"))
+    display(channel_summary_df(results).round(2))
+
+    display(Markdown("## Daily Decision Timeline"))
+    daily_df = results_to_daily_df(results)
+    cols = [
+        "day", "date", "decision_type", "top_channel",
+        "agent_conversions", "baseline_conversions",
+        "agent_cpa", "search_alloc", "social_alloc", "display_alloc"
+    ]
+    display(daily_df[cols].round(4))
+
+    display(Markdown("## Agent Log"))
+    display(daily_df[["day", "date", "reason"]])
+
+    display(Markdown("## Brief Results Explanation"))
+    display(Markdown(
+        "The agent improves on the equal-split baseline by shifting budget "
+        "toward channels with stronger conversion efficiency while still keeping "
+        "all channels active through the minimum allocation floor."
+    ))
+
+    plot_results(results)
+
+
+# Run agent and show data
+def run_and_display(budget=50000, max_shift_pct=15, floor_pct=10, explore_pct=15, seed=7):
+    params = Params(
+        budget=int(budget),
+        max_shift=max_shift_pct / 100,
+        floor=floor_pct / 100,
+        explore_rate=explore_pct / 100,
+        seed=None if seed in (None, "") else int(seed),
+    )
+
+    results = run_simulation(params)
+    display_results(results)
+    return results
+
+
+# Created dataset visualization
+def launch_ui():
+    budget = widgets.IntSlider(value=50000, min=10000, max=100000, step=5000, description="Budget")
+    max_shift = widgets.IntSlider(value=15, min=5, max=20, step=5, description="Max shift %")
+    floor = widgets.IntSlider(value=10, min=5, max=20, step=5, description="Floor %")
+    explore = widgets.IntSlider(value=15, min=0, max=30, step=5, description="Explore %")
+    seed = widgets.IntText(value=7, description="Seed")
+
+    run_btn = widgets.Button(description="Run Agent", button_style="success")
+    reset_btn = widgets.Button(description="Reset")
+    out = widgets.Output()
+
+    def on_run_clicked(_):
+        with out:
+            clear_output(wait=True)
+            run_and_display(
+                budget=budget.value,
+                max_shift_pct=max_shift.value,
+                floor_pct=floor.value,
+                explore_pct=explore.value,
+                seed=seed.value,
+            )
+
+    def on_reset_clicked(_):
+        with out:
+            clear_output(wait=True)
+            display(Markdown("_Adjust parameters, then click **Run Agent**._"))
+
+    run_btn.on_click(on_run_clicked)
+    reset_btn.on_click(on_reset_clicked)
+
+    controls = widgets.VBox([
+        widgets.HBox([budget, max_shift]),
+        widgets.HBox([floor, explore]),
+        widgets.HBox([seed, run_btn, reset_btn]),
+        out,
+    ])
+
+    display(Markdown("# Ad Optimization Agent"))
+    display(Markdown("Interactive notebook version for testing budget decisions."))
+    display(controls)
+
+    with out:
+        display(Markdown("_Adjust parameters, then click **Run Agent**._"))
+
+
+if __name__ == "__main__":
+    run_and_display()
+
+launch_ui()
