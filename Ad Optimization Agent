@@ -1,4 +1,6 @@
-#Link to Colab: https://colab.research.google.com/drive/11cuHq6mBfuiLCJEP9AlLENyHVA_H16p4?usp=sharing
+# Link to Colab: https://colab.research.google.com/drive/11cuHq6mBfuiLCJEP9AlLENyHVA_H16p4?usp=sharing
+# Allow random exploration
+
 import random
 from typing import Dict, List, Optional
 
